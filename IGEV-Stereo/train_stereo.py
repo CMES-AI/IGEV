@@ -1,19 +1,25 @@
 from __future__ import print_function, division
+
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
+
 import argparse
 import logging
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+
 from torch.utils.tensorboard import SummaryWriter
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from core.igev_stereo import IGEVStereo
 from evaluate_stereo import *
 import core.stereo_datasets as datasets
 import torch.nn.functional as F
+
 try:
     from torch.cuda.amp import GradScaler
 except:
@@ -41,8 +47,7 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, ma
     assert valid.shape == disp_gt.shape, [valid.shape, disp_gt.shape]
     assert not torch.isinf(disp_gt[valid.bool()]).any()
 
-
-    disp_loss += 1.0 * F.smooth_l1_loss(disp_init_pred[valid.bool()], disp_gt[valid.bool()], size_average=True)
+    disp_loss += 1.0 * F.smooth_l1_loss(disp_init_pred[valid.bool()], disp_gt[valid.bool()], reduction='mean')
     for i in range(n_predictions):
         adjusted_loss_gamma = loss_gamma**(15/(n_predictions - 1))
         i_weight = adjusted_loss_gamma**(n_predictions - i - 1)
@@ -76,7 +81,7 @@ class Logger:
         self.scheduler = scheduler
         self.total_steps = 0
         self.running_loss = {}
-        self.writer = SummaryWriter(log_dir=args.logdir)
+        self.writer = SummaryWriter(log_dir=args.logdir + "/logs")
 
     def _print_training_status(self):
         metrics_data = [self.running_loss[k]/Logger.SUM_FREQ for k in sorted(self.running_loss.keys())]
@@ -87,7 +92,7 @@ class Logger:
         logging.info(f"Training Metrics ({self.total_steps}): {training_str + metrics_str}")
 
         if self.writer is None:
-            self.writer = SummaryWriter(log_dir=args.logdir)
+            self.writer = SummaryWriter(log_dir=args.logdir + '/logs')
 
         for k in self.running_loss:
             self.writer.add_scalar(k, self.running_loss[k]/Logger.SUM_FREQ, self.total_steps)
@@ -108,7 +113,7 @@ class Logger:
 
     def write_dict(self, results):
         if self.writer is None:
-            self.writer = SummaryWriter(log_dir=args.logdir)
+            self.writer = SummaryWriter(log_dir=args.logdir + '/logs')
 
         for key in results:
             self.writer.add_scalar(key, results[key], self.total_steps)
@@ -144,7 +149,6 @@ def train(args):
     should_keep_training = True
     global_batch_num = 0
     while should_keep_training:
-
         for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
             optimizer.zero_grad()
             image1, image2, disp_gt, valid = [x.cuda() for x in data_blob]
@@ -161,13 +165,13 @@ def train(args):
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            scaler.step(optimizer)
             scheduler.step()
+            scaler.step(optimizer)
             scaler.update()
             logger.push(metrics)
 
             if total_steps % validation_frequency == validation_frequency - 1:
-                save_path = Path(args.logdir + '/%d_%s.pth' % (total_steps + 1, args.name))
+                save_path = Path(args.logdir + '/weights/%d_%s.pth' % (total_steps + 1, args.name))
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
                 if 'sceneflow' in args.train_datasets:
@@ -176,7 +180,7 @@ def train(args):
                     results = validate_kitti(model.module, iters=args.valid_iters)
                 else: 
                     raise Exception('Unknown validation dataset.')
-                logger.write_dict(results)
+                # logger.write_dict(results)
                 model.train()
                 model.module.freeze_bn()
 
@@ -187,13 +191,13 @@ def train(args):
                 break
 
         if len(train_loader) >= 10000:
-            save_path = Path(args.logdir + '/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
+            save_path = Path(args.logdir + '/weights/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
             logging.info(f"Saving file {save_path}")
             torch.save(model.state_dict(), save_path)
 
     print("FINISHED TRAINING")
     logger.close()
-    PATH = args.logdir + '/%s.pth' % args.name
+    PATH = args.logdir + '/weights/%s.pth' % args.name
     torch.save(model.state_dict(), PATH)
 
     return PATH
@@ -204,13 +208,13 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='igev-stereo', help="name your experiment")
     parser.add_argument('--restore_ckpt', default=None, help="load the weights from a specific checkpoint")
     parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
-    parser.add_argument('--logdir', default='./checkpoints/sceneflow', help='the directory to save logs and checkpoints')
+    parser.add_argument('--logdir', default='/gpfs/philip/weights/IGEV-Stereo/20230802_test', help='the directory to save logs and checkpoints')
 
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=8, help="batch size used during training.")
-    parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
+    parser.add_argument('--batch_size', type=int, default=24, help="batch size used during training.")
+    parser.add_argument('--train_datasets', nargs='+', default=['CMES', 'CMESNoisy'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
-    parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
+    parser.add_argument('--num_steps', type=int, default=40000, help="length of training schedule.")
     parser.add_argument('--image_size', type=int, nargs='+', default=[320, 736], help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=22, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
@@ -228,6 +232,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
     parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
+    parser.add_argument('--disp_divide', type=int, default=4, help="tmp")
 
     # Data augmentation
     parser.add_argument('--img_gamma', type=float, nargs='+', default=None, help="gamma range")
@@ -243,6 +248,7 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
 
-    Path(args.logdir).mkdir(exist_ok=True, parents=True)
+    Path(args.logdir + '/weights').mkdir(exist_ok=True, parents=True)
+    Path(args.logdir + '/logs').mkdir(exist_ok=True, parents=True)
 
     train(args)

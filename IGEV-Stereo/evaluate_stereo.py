@@ -213,6 +213,48 @@ def validate_middlebury(model, iters=32, split='F', mixed_prec=False):
     print(f"Validation Middlebury{split}: EPE {epe}, D1 {d1}")
     return {f'middlebury{split}-epe': epe, f'middlebury{split}-d1': d1}
 
+@torch.no_grad()
+def validate_coupang(model, iters=32, mixed_prec=False):
+    """ Peform validation using the Coupang (train) split """
+    model.eval()
+    aug_params = {}
+    val_dataset = datasets.CMESCoupang(aug_params)
+
+    out_list, epe_list = [], []
+    for val_id in range(len(val_dataset)):
+        (imageL_file, imageR_file, GT_file), image1, image2, flow_gt, valid_gt = val_dataset[val_id]
+        image1 = image1[None].cuda()
+        image2 = image2[None].cuda()
+
+        padder = InputPadder(image1.shape, divis_by=32)
+        image1, image2 = padder.pad(image1, image2)
+
+        with autocast(enabled=mixed_prec):
+            flow_pr = model(image1, image2, iters=iters, test_mode=True)
+        flow_pr = padder.unpad(flow_pr.float()).cpu().squeeze(0)
+        assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
+        epe = torch.sum((flow_pr - flow_gt)**2, dim=0).sqrt()
+
+        epe_flattened = epe.flatten()
+
+        val = (valid_gt.flatten() >= 0.5) & (flow_gt.abs().flatten() < 192)
+        # val = (valid_gt.flatten() >= 0.5)
+        out = (epe_flattened > 1.0)
+        image_out = out[val].float().mean().item()
+        image_epe = epe_flattened[val].mean().item()
+        logging.info(f"Coupang {val_id+1} out of {len(val_dataset)}. EPE {round(image_epe,4)} D1 {round(image_out,4)}")
+        epe_list.append(image_epe)
+        out_list.append(image_out)
+
+    epe_list = np.array(epe_list)
+    out_list = np.array(out_list)
+
+    epe = np.mean(epe_list)
+    d1 = 100 * np.mean(out_list)
+
+    print("Validation Coupang: EPE %f, D1 %f" % (epe, d1))
+    return {'coupang-epe': epe, 'coupang-d1': d1}
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
