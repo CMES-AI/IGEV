@@ -152,7 +152,6 @@ def readDispTartanAir(file_name):
     valid = disp > 0
     return disp, valid
 
-
 def readDispMiddlebury(file_name):
     assert basename(file_name) == 'disp0GT.pfm'
     disp = readPFM(file_name).astype(np.float32)
@@ -162,6 +161,20 @@ def readDispMiddlebury(file_name):
     nocc_pix = imageio.imread(nocc_pix) == 255
     assert np.any(nocc_pix)
     return disp, nocc_pix
+
+def readDispCoupang(file_name):
+    try:
+        disp = Image.open(file_name)
+        image_array = np.asarray(disp)
+        image_array = (((image_array - image_array.min()) / (image_array.max() - image_array.min())) * 255).astype(np.uint8)
+
+        return image_array
+    except IOError as e:
+        print(file_name, " has an OS Error.: ", e)
+        return None
+    except Exception as e:
+        print("Error: ", e)
+        return None
 
 def writeFlowKITTI(filename, uv):
     uv = 64.0 * uv + 2**15

@@ -172,7 +172,7 @@ class IGEVStereo(nn.Module):
 
             # Init disp from geometry encoding volume
             prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
-            init_disp = disparity_regression(prob, self.args.max_disp//4)
+            init_disp = disparity_regression(prob, self.args.max_disp // self.args.disp_divide)
             
             del prob, gwc_volume
 

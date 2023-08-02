@@ -1,9 +1,13 @@
+import cv2
 import numpy as np
 import torch
 import torch.utils.data as data
 import torch.nn.functional as F
 import logging
+import open3d as o3d
 import os
+import PIL
+import sys
 import re
 import copy
 import math
@@ -11,13 +15,14 @@ import random
 from pathlib import Path
 from glob import glob
 import os.path as osp
+import yaml
 
 from core.utils import frame_utils
 from core.utils.augmentor import FlowAugmentor, SparseFlowAugmentor
 
 
 class StereoDataset(data.Dataset):
-    def __init__(self, aug_params=None, sparse=False, reader=None):
+    def __init__(self, aug_params=None, sparse=False, reader=None, depth_conv=False):
         self.augmentor = None
         self.sparse = sparse
         self.img_pad = aug_params.pop("img_pad", None) if aug_params is not None else None
@@ -34,8 +39,11 @@ class StereoDataset(data.Dataset):
 
         self.is_test = False
         self.init_seed = False
+        self.depth_conv = depth_conv
+
         self.flow_list = []
         self.disparity_list = []
+        self.point_cloud_list = []
         self.image_list = []
         self.extra_info = []
 
@@ -59,9 +67,17 @@ class StereoDataset(data.Dataset):
                 self.init_seed = True
 
         index = index % len(self.image_list)
-        disp = self.disparity_reader(self.disparity_list[index])
-        
-        if isinstance(disp, tuple):
+
+        if len(self.point_cloud_list) != 0:
+            disp = ply_to_disp(self.point_cloud_list[index])
+        elif self.depth_conv:
+            disp = depth_to_disp(self.disparity_list[index])
+        else:
+            disp = self.disparity_reader(self.disparity_list[index])   
+     
+        if disp is None:
+            pass
+        elif isinstance(disp, tuple):
             disp, valid = disp
         else:
             valid = disp < 512
@@ -88,7 +104,6 @@ class StereoDataset(data.Dataset):
             if self.sparse:
                 img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
             else:
-
                 img1, img2, flow = self.augmentor(img1, img2, flow)
 
         img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
@@ -107,8 +122,11 @@ class StereoDataset(data.Dataset):
             img2 = F.pad(img2, [padW]*2 + [padH]*2)
 
         flow = flow[:1]
-        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float()
 
+        if len(self.point_cloud_list) == 0:
+            return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float()
+        else:
+            return self.image_list[index] + [self.point_cloud_list[index]], img1, img2, flow, valid.float()
 
     def __mul__(self, v):
         copy_of_self = copy.deepcopy(self)
@@ -266,7 +284,6 @@ class KITTI(StereoDataset):
             self.image_list += [ [img1, img2] ]
             self.disparity_list += [ disp ]
 
-
 class Middlebury(StereoDataset):
     def __init__(self, aug_params=None, root='/data/Middlebury', split='F'):
         super(Middlebury, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispMiddlebury)
@@ -286,6 +303,61 @@ class Middlebury(StereoDataset):
             self.image_list += [ [img1, img2] ]
             self.disparity_list += [ disp ]
 
+class CMESTower(StereoDataset):
+    def __init__(self, aug_params=None, root='/gpfs/philip/cmes_data/cmes_stereo_dataset'):
+        super().__init__(aug_params, reader=frame_utils.readDispCoupang)
+        assert os.path.exists(root)
+
+        image1_list = sorted(glob(osp.join(root, 'orderpicking_noisy/train/simulator_prev/*/*_color_left.png')))
+        image2_list = sorted(glob(osp.join(root, 'orderpicking_noisy/train/simulator_prev/*/*_color_right.png')))
+        disp_list = sorted(glob(osp.join(root, 'orderpicking_noisy/train/simulator_prev/*/*_disp.png')))
+
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            self.image_list += [[img1, img2]]
+            self.disparity_list += [disp]
+
+class CMESNoisy(StereoDataset):
+    def __init__(self, aug_params=None, root='/gpfs/philip/cmes_data/cmes_stereo_dataset'):
+        super().__init__(aug_params, reader=frame_utils.readDispCoupang)
+        assert os.path.exists(root)
+
+        image1_list = sorted(glob(osp.join(root, 'orderpicking_noisy/train/simulator_prev/*/*_color_left_noise.png')))
+        image2_list = sorted(glob(osp.join(root, 'orderpicking_noisy/train/simulator_prev/*/*_color_right_noise.png')))
+        disp_list = sorted(glob(osp.join(root, 'orderpicking_noisy/train/simulator_prev/*/*_noise_disp.png')))
+
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            self.image_list += [[img1, img2]]
+            self.disparity_list += [disp]
+
+class CMESCoupang(StereoDataset):
+    def __init__(self, aug_params=None, root='/gpfs/philip/cmes_data/coupang_goyang/20230403'):
+        super().__init__(aug_params, reader=frame_utils.readDispCoupang)
+        assert os.path.exists(root)
+
+        image1_list = sorted(glob(osp.join(root, '*_color.png')))
+        image2_list = sorted(glob(osp.join(root, '*_color_R.png')))
+        disp_list = sorted(glob(osp.join(root, '*_disp16.png')))
+
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            self.image_list += [[img1, img2]]
+            self.disparity_list += [disp]
+
+class THEOStereo(StereoDataset):
+    def __init__(self, aug_params=None, root='/gpfs/philip/depth_open_data/THEOStereo'):
+        os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
+
+        super().__init__(aug_params, reader=frame_utils.readDispCoupang)
+        assert os.path.exists(root)
+
+        image1_list = sorted(glob(osp.join(root, 'train/img_left_png/*.png')))
+        image2_list = sorted(glob(osp.join(root, 'train/img_right_png/*.png')))
+        disp_list = sorted(glob(osp.join(root, 'train/disp_png/*.png')))
+
+        assert len(image1_list) == len(image2_list) == len(disp_list) > 0
+
+        for img1, img2, disp in zip(image1_list, image2_list, disp_list):
+            self.image_list += [[img1, img2]]
+            self.disparity_list += [disp]
   
 def fetch_dataloader(args):
     """ Create the data loader for the corresponding trainign set """
@@ -321,6 +393,18 @@ def fetch_dataloader(args):
         elif dataset_name.startswith('tartan_air'):
             new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:])
             logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
+        elif dataset_name == 'THEOStereo':
+            new_dataset = THEOStereo(aug_params)
+            logging.info(f"Adding {len(new_dataset)} samples from THEOStereo")
+        elif dataset_name == 'coupang':
+            new_dataset = CMESCoupang(aug_params)
+            logging.info(f"Adding {len(new_dataset)} samples from Coupang dataset")
+        elif dataset_name == 'CMES':
+            new_dataset = CMESTower(aug_params)
+            logging.info(f"Adding {len(new_dataset)} samples from CMES dataset")
+        elif dataset_name == 'CMESNoisy':
+            new_dataset = CMESNoisy(aug_params)
+            logging.info(f"Adding {len(new_dataset)} samples from CMES dataset")
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
@@ -329,3 +413,59 @@ def fetch_dataloader(args):
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader
 
+
+def ply_to_disp(ply_path):
+    input_param_path = "params/zed2.yaml"
+
+    with open(input_param_path) as input_yaml:
+        input_params = yaml.load(input_yaml, Loader=yaml.FullLoader)
+        input_size = np.array(input_params['image_size'])
+        input_intrinsics = np.array(input_params['intrinsics'])
+        input_baseline = np.array(input_params['baseline'])
+        extrinsics = np.array(input_params['extrinsics_photoneo'])
+        # extrinsics = np.array(input_params['extrinsics_zivid'])
+
+    ply = o3d.io.read_point_cloud(ply_path)
+    ply.transform(extrinsics)
+    ply_points = np.asarray(ply.points)
+
+    pixels_2d = []
+    depth_value = []
+
+    for point_3d in ply_points:
+        point_3d_homogeneous = np.append(point_3d, 1.0)
+        point_3d_homogeneous = point_3d_homogeneous.T
+
+        point_2d_homogeneous = input_intrinsics @ point_3d
+        point_2d = (point_2d_homogeneous[:-1] / point_2d_homogeneous[2]).astype(int)
+        pixels_2d.append(point_2d.tolist())
+        depth_value.append(point_3d[2])
+
+    warped_depth = np.zeros((input_size[1], input_size[0]), dtype=np.float32)
+
+    for pixel, depth in zip(pixels_2d,  depth_value):
+        if (0 < pixel[0]) and (pixel[0] < input_size[0]) and (0 < pixel[1]) and (pixel[1] < input_size[1]):
+            if (warped_depth[pixel[1], pixel[0]] == 0):
+                warped_depth[pixel[1], pixel[0]] = depth
+
+    focal_length = math.sqrt(math.pow(input_intrinsics[0][0], 2) + math.pow(input_intrinsics[1][1], 2))
+    disp = (input_baseline * focal_length / (warped_depth + sys.float_info.epsilon))
+
+    return disp
+
+def depth_to_disp(depth_path):
+    # input_param_path = "params/theostereo.yaml"
+    input_param_path = "params/zivid_m70.yaml"
+
+    with open(input_param_path) as input_yaml:
+        input_params = yaml.load(input_yaml, Loader=yaml.FullLoader)
+        input_intrinsics = np.array(input_params['intrinsics'])
+        input_baseline = np.array(input_params['baseline'])
+
+    depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    # depth = np.asarray(depth)
+
+    focal_length = math.sqrt(math.pow(input_intrinsics[0][0], 2) + math.pow(input_intrinsics[1][1], 2))
+    disp = (input_baseline * focal_length / (depth + sys.float_info.epsilon))
+
+    return disp
